@@ -52,6 +52,11 @@ export default function App() {
   const [soundObj, setSoundObj] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [loadingSound, setLoadingSound] = useState(false);
+  
+  // Audio Progress
+  const [duration, setDuration] = useState(0);
+  const [position, setPosition] = useState(0);
+  const [isSliding, setIsSliding] = useState(false);
 
   // Recording
   const recordingRef = useRef(null);
@@ -200,43 +205,74 @@ export default function App() {
   const pickAudioFile = async () => {
     try {
       const res = await DocumentPicker.getDocumentAsync({
-        type: 'audio/*',
+        type: ['audio/*', 'audio/mp3', 'audio/mpeg', 'audio/wav', 'audio/m4a', 'audio/aac'],
         copyToCacheDirectory: false, // we'll handle copying
+        multiple: false,
       });
-      if (res.type !== 'success') return;
-
-      let finalUri = res.uri;
+      
+      if (res.canceled || !res.assets || res.assets.length === 0) return;
+      
+      const file = res.assets[0];
+      let finalUri = file.uri;
+      const fileName = file.name || `imported-${Date.now()}.mp3`;
+      
       // On Android the URI may be content://; on iOS it's usually file://
       // Try to get file into app cache so expo-av can use it reliably
       if (!finalUri.startsWith(FileSystem.cacheDirectory) && !finalUri.startsWith('file://')) {
         // Attempt to read as base64 and write into cache
         try {
+          console.log('Reading file from content URI:', finalUri);
           const b64 = await FileSystem.readAsStringAsync(finalUri, { encoding: FileSystem.EncodingType.Base64 });
-          const dest = FileSystem.cacheDirectory + (res.name || `imported-${Date.now()}.aac`);
+          const dest = FileSystem.cacheDirectory + fileName;
           await FileSystem.writeAsStringAsync(dest, b64, { encoding: FileSystem.EncodingType.Base64 });
           finalUri = dest;
+          console.log('Successfully copied to cache:', finalUri);
         } catch (e) {
-          // fallback: try to download (works for http(s))
+          // fallback: try to copy using copyAsync if available
           try {
-            const dest = FileSystem.cacheDirectory + (res.name || `imported-${Date.now()}.aac`);
-            await FileSystem.downloadAsync(finalUri, dest);
+            const dest = FileSystem.cacheDirectory + fileName;
+            await FileSystem.copyAsync({ from: finalUri, to: dest });
             finalUri = dest;
+            console.log('Successfully copied using copyAsync:', finalUri);
           } catch (e2) {
-            console.error('pickAudioFile: unable to copy content URI', e, e2);
-            Alert.alert('Import failed', 'Could not import selected audio file.');
-            return;
+            // final fallback: try to download (works for http(s))
+            try {
+              const dest = FileSystem.cacheDirectory + fileName;
+              await FileSystem.downloadAsync(finalUri, dest);
+              finalUri = dest;
+              console.log('Successfully downloaded:', finalUri);
+            } catch (e3) {
+              console.error('pickAudioFile: unable to copy content URI', e, e2, e3);
+              Alert.alert('Import failed', 'Could not import selected audio file. Please try a different file or method.');
+              return;
+            }
           }
         }
       } else if (finalUri.startsWith(FileSystem.cacheDirectory)) {
         // already in cache
+        console.log('File already in cache:', finalUri);
       } else if (!finalUri.startsWith('file://')) {
         // Try prefixing file:// on some systems
         finalUri = 'file://' + finalUri;
+        console.log('Added file:// prefix:', finalUri);
+      }
+
+      // Verify the file exists and is accessible
+      try {
+        const fileInfo = await FileSystem.getInfoAsync(finalUri);
+        if (!fileInfo.exists) {
+          throw new Error('File does not exist at final URI');
+        }
+        console.log('File verified, size:', fileInfo.size, 'bytes');
+      } catch (e) {
+        console.error('File verification failed:', e);
+        Alert.alert('Import failed', 'The imported file could not be accessed. Please try again.');
+        return;
       }
 
       // Save state
       setAudioUri(finalUri);
-      setAudioName(res.name || 'Imported Audio');
+      setAudioName(fileName);
       setTranscript(''); // reset transcript for this audio
       setSummary('');
       // unload previous sound
@@ -257,7 +293,7 @@ export default function App() {
           await s.unloadAsync();
           const entry = {
             id: 'h' + Date.now(),
-            name: res.name || 'Imported Audio',
+            name: fileName,
             uri: finalUri,
             ts: Date.now(),
             duration: durationSec,
@@ -265,11 +301,13 @@ export default function App() {
             summary: null,
           };
           await addToHistory(entry);
+          console.log('Added to history with duration:', durationSec);
         } catch (e) {
           // if we can't load duration, still add (without duration)
+          console.warn('Could not get duration:', e);
           const entry = {
             id: 'h' + Date.now(),
-            name: res.name || 'Imported Audio',
+            name: fileName,
             uri: finalUri,
             ts: Date.now(),
             duration: null,
@@ -279,9 +317,11 @@ export default function App() {
           await addToHistory(entry);
         }
       }
+      
+      Alert.alert('Success', `Audio file "${fileName}" imported successfully!`);
     } catch (e) {
       console.error('pickAudioFile', e);
-      Alert.alert('Error', 'Unable to pick audio file.');
+      Alert.alert('Error', 'Unable to pick audio file: ' + e.message);
     }
   };
 
@@ -395,7 +435,11 @@ export default function App() {
         setSoundObj(null);
         setIsPlaying(false);
       }
-      const { sound } = await Audio.Sound.createAsync({ uri: uriToPlay }, { shouldPlay: true }, onPlaybackStatus);
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: uriToPlay }, 
+        { shouldPlay: true, progressUpdateIntervalMillis: 100 }, 
+        onPlaybackStatus
+      );
       setSoundObj(sound);
       setIsPlaying(true);
     } catch (e) {
@@ -409,8 +453,18 @@ export default function App() {
   const onPlaybackStatus = (status) => {
     if (!status) return;
     setIsPlaying(status.isPlaying);
+    
+    if (status.durationMillis) {
+      setDuration(status.durationMillis);
+    }
+    
+    if (status.positionMillis && !isSliding) {
+      setPosition(status.positionMillis);
+    }
+    
     if (status.didJustFinish) {
       setIsPlaying(false);
+      setPosition(0);
     }
   };
 
@@ -431,8 +485,33 @@ export default function App() {
       await soundObj.unloadAsync();
       setSoundObj(null);
       setIsPlaying(false);
+      setPosition(0);
+      setDuration(0);
     } catch (e) {
       console.warn('stopAndUnload', e);
+    }
+  };
+
+  /* ------------------ AUDIO SEEKING ------------------ */
+  const formatTime = (millis) => {
+    const totalSeconds = Math.floor(millis / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+  };
+
+  const onSliderValueChange = async (value) => {
+    if (!soundObj || !duration) return;
+    
+    setIsSliding(true);
+    setPosition(value);
+    
+    try {
+      await soundObj.setPositionAsync(value);
+    } catch (e) {
+      console.warn('Seek failed', e);
+    } finally {
+      setIsSliding(false);
     }
   };
 
@@ -649,12 +728,60 @@ export default function App() {
             >
               <Text style={theme.buttonSecondaryText}>{isPlaying ? 'Pause' : 'Play'}</Text>
             </TouchableOpacity>
+
+            {audioUri && (
+              <TouchableOpacity style={theme.buttonTertiary} onPress={stopAndUnload}>
+                <Text style={theme.buttonTertiaryText}>Stop</Text>
+              </TouchableOpacity>
+            )}
           </View>
 
           <View style={{ marginTop: 12 }}>
             <Text style={theme.smallText}>Selected:</Text>
             <Text style={theme.largeText}>{audioName || 'No audio selected'}</Text>
           </View>
+
+          {/* Audio Progress Slider */}
+          {audioUri && (
+            <View style={theme.progressContainer}>
+              <View style={theme.timeContainer}>
+                <Text style={theme.timeText}>{formatTime(position)}</Text>
+                <Text style={theme.timeText}>{formatTime(duration)}</Text>
+              </View>
+              
+              <View style={theme.sliderContainer}>
+                <TouchableOpacity
+                  style={theme.progressTrack}
+                  onPress={(event) => {
+                    if (!duration) return;
+                    const { locationX } = event.nativeEvent;
+                    const { width } = event.currentTarget.measure ? {} : { width: 300 }; // fallback
+                    // Get the actual width from the layout
+                    event.currentTarget.measure((x, y, width) => {
+                      const newPosition = (locationX / width) * duration;
+                      onSliderValueChange(newPosition);
+                    });
+                  }}
+                >
+                  <View 
+                    style={[
+                      theme.progressFill, 
+                      { width: duration > 0 ? `${(position / duration) * 100}%` : '0%' }
+                    ]} 
+                  />
+                  <View 
+                    style={[
+                      theme.progressThumb, 
+                      { 
+                        left: duration > 0 ? `${(position / duration) * 100}%` : '0%',
+                        marginLeft: -8 // half of thumb width
+                      }
+                    ]} 
+                  />
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
 
           <View style={{ marginTop: 14, flexDirection: 'row', justifyContent: 'space-between' }}>
             <TouchableOpacity style={theme.actionButton} onPress={openTranscriptEditor}>
@@ -942,10 +1069,15 @@ const stylesLight = StyleSheet.create({
   buttonAccentText: { color: '#fff', fontWeight: '700' },
   buttonSecondary: { backgroundColor: '#11182710', padding: 10, borderRadius: 10, minWidth: 70, alignItems: 'center' },
   buttonSecondaryText: { color: '#0F172A', fontWeight: '700' },
+  buttonTertiary: { backgroundColor: '#6B7280', padding: 10, borderRadius: 10, minWidth: 60, alignItems: 'center' },
 
   largeText: { color: '#0F172A', fontSize: 14, marginTop: 4 },
   actionButton: { backgroundColor: '#11182706', padding: 10, borderRadius: 10, minWidth: 140, alignItems: 'center' },
   actionButtonText: { color: '#0F172A', fontWeight: '700' },
+
+  // Missing auth button styles
+  authButton: { backgroundColor: '#3B82F6', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8 },
+  authButtonText: { color: '#fff', fontSize: 12, fontWeight: '600' },
 
   modalOverlay: { flex: 1, backgroundColor: '#00000060', justifyContent: 'center', alignItems: 'center', padding: 16 },
   modalCard: { width: '100%', maxWidth: 640, backgroundColor: '#fff', borderRadius: 12, padding: 16 },
@@ -976,6 +1108,40 @@ const stylesLight = StyleSheet.create({
   quizQuestion: { color: '#0F172A', fontWeight: '700', marginBottom: 6 },
   quizOption: { borderWidth: 1, borderColor: '#E5E7EB', padding: 10, borderRadius: 8, marginTop: 6, flexDirection: 'row', justifyContent: 'space-between' },
   quizOptionText: { color: '#0F172A' },
+
+  // Audio Progress Styles
+  progressContainer: { marginTop: 12, paddingHorizontal: 4 },
+  timeContainer: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 },
+  timeText: { fontSize: 12, color: '#6B7280' },
+  sliderContainer: { marginVertical: 4 },
+  progressTrack: {
+    height: 4,
+    backgroundColor: '#E5E7EB',
+    borderRadius: 2,
+    position: 'relative',
+    justifyContent: 'center'
+  },
+  progressFill: {
+    height: 4,
+    backgroundColor: '#3B82F6',
+    borderRadius: 2,
+    position: 'absolute',
+    left: 0,
+    top: 0
+  },
+  progressThumb: {
+    width: 16,
+    height: 16,
+    backgroundColor: '#3B82F6',
+    borderRadius: 8,
+    position: 'absolute',
+    top: -6,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3,
+    elevation: 3
+  },
 });
 
 const stylesDark = StyleSheet.create({
@@ -997,10 +1163,15 @@ const stylesDark = StyleSheet.create({
   buttonAccentText: { color: '#fff', fontWeight: '700' },
   buttonSecondary: { backgroundColor: '#11182710', padding: 10, borderRadius: 10, minWidth: 70, alignItems: 'center' },
   buttonSecondaryText: { color: '#E6EEF8', fontWeight: '700' },
+  buttonTertiary: { backgroundColor: '#6B7280', padding: 10, borderRadius: 10, minWidth: 60, alignItems: 'center' },
 
   largeText: { color: '#E6EEF8', fontSize: 14, marginTop: 4 },
   actionButton: { backgroundColor: '#07102110', padding: 10, borderRadius: 10, minWidth: 140, alignItems: 'center' },
   actionButtonText: { color: '#E6EEF8', fontWeight: '700' },
+
+  // Missing auth button styles
+  authButton: { backgroundColor: '#2563EB', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8 },
+  authButtonText: { color: '#fff', fontSize: 12, fontWeight: '600' },
 
   modalOverlay: { flex: 1, backgroundColor: '#00000060', justifyContent: 'center', alignItems: 'center', padding: 16 },
   modalCard: { width: '100%', maxWidth: 640, backgroundColor: '#0F172A', borderRadius: 12, padding: 16 },
@@ -1031,4 +1202,38 @@ const stylesDark = StyleSheet.create({
   quizQuestion: { color: '#E6EEF8', fontWeight: '700', marginBottom: 6 },
   quizOption: { borderWidth: 1, borderColor: '#0B1220', padding: 10, borderRadius: 8, marginTop: 6, flexDirection: 'row', justifyContent: 'space-between', backgroundColor: '#071021' },
   quizOptionText: { color: '#E6EEF8' },
+
+  // Audio Progress Styles
+  progressContainer: { marginTop: 12, paddingHorizontal: 4 },
+  timeContainer: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 },
+  timeText: { fontSize: 12, color: '#94A3B8' },
+  sliderContainer: { marginVertical: 4 },
+  progressTrack: {
+    height: 4,
+    backgroundColor: '#374151',
+    borderRadius: 2,
+    position: 'relative',
+    justifyContent: 'center'
+  },
+  progressFill: {
+    height: 4,
+    backgroundColor: '#2563EB',
+    borderRadius: 2,
+    position: 'absolute',
+    left: 0,
+    top: 0
+  },
+  progressThumb: {
+    width: 16,
+    height: 16,
+    backgroundColor: '#2563EB',
+    borderRadius: 8,
+    position: 'absolute',
+    top: -6,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3,
+    elevation: 3
+  },
 });
