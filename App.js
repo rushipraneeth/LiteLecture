@@ -200,43 +200,74 @@ export default function App() {
   const pickAudioFile = async () => {
     try {
       const res = await DocumentPicker.getDocumentAsync({
-        type: 'audio/*',
+        type: ['audio/*', 'audio/mp3', 'audio/mpeg', 'audio/wav', 'audio/m4a', 'audio/aac'],
         copyToCacheDirectory: false, // we'll handle copying
+        multiple: false,
       });
-      if (res.type !== 'success') return;
-
-      let finalUri = res.uri;
+      
+      if (res.canceled || !res.assets || res.assets.length === 0) return;
+      
+      const file = res.assets[0];
+      let finalUri = file.uri;
+      const fileName = file.name || `imported-${Date.now()}.mp3`;
+      
       // On Android the URI may be content://; on iOS it's usually file://
       // Try to get file into app cache so expo-av can use it reliably
       if (!finalUri.startsWith(FileSystem.cacheDirectory) && !finalUri.startsWith('file://')) {
         // Attempt to read as base64 and write into cache
         try {
+          console.log('Reading file from content URI:', finalUri);
           const b64 = await FileSystem.readAsStringAsync(finalUri, { encoding: FileSystem.EncodingType.Base64 });
-          const dest = FileSystem.cacheDirectory + (res.name || `imported-${Date.now()}.aac`);
+          const dest = FileSystem.cacheDirectory + fileName;
           await FileSystem.writeAsStringAsync(dest, b64, { encoding: FileSystem.EncodingType.Base64 });
           finalUri = dest;
+          console.log('Successfully copied to cache:', finalUri);
         } catch (e) {
-          // fallback: try to download (works for http(s))
+          // fallback: try to copy using copyAsync if available
           try {
-            const dest = FileSystem.cacheDirectory + (res.name || `imported-${Date.now()}.aac`);
-            await FileSystem.downloadAsync(finalUri, dest);
+            const dest = FileSystem.cacheDirectory + fileName;
+            await FileSystem.copyAsync({ from: finalUri, to: dest });
             finalUri = dest;
+            console.log('Successfully copied using copyAsync:', finalUri);
           } catch (e2) {
-            console.error('pickAudioFile: unable to copy content URI', e, e2);
-            Alert.alert('Import failed', 'Could not import selected audio file.');
-            return;
+            // final fallback: try to download (works for http(s))
+            try {
+              const dest = FileSystem.cacheDirectory + fileName;
+              await FileSystem.downloadAsync(finalUri, dest);
+              finalUri = dest;
+              console.log('Successfully downloaded:', finalUri);
+            } catch (e3) {
+              console.error('pickAudioFile: unable to copy content URI', e, e2, e3);
+              Alert.alert('Import failed', 'Could not import selected audio file. Please try a different file or method.');
+              return;
+            }
           }
         }
       } else if (finalUri.startsWith(FileSystem.cacheDirectory)) {
         // already in cache
+        console.log('File already in cache:', finalUri);
       } else if (!finalUri.startsWith('file://')) {
         // Try prefixing file:// on some systems
         finalUri = 'file://' + finalUri;
+        console.log('Added file:// prefix:', finalUri);
+      }
+
+      // Verify the file exists and is accessible
+      try {
+        const fileInfo = await FileSystem.getInfoAsync(finalUri);
+        if (!fileInfo.exists) {
+          throw new Error('File does not exist at final URI');
+        }
+        console.log('File verified, size:', fileInfo.size, 'bytes');
+      } catch (e) {
+        console.error('File verification failed:', e);
+        Alert.alert('Import failed', 'The imported file could not be accessed. Please try again.');
+        return;
       }
 
       // Save state
       setAudioUri(finalUri);
-      setAudioName(res.name || 'Imported Audio');
+      setAudioName(fileName);
       setTranscript(''); // reset transcript for this audio
       setSummary('');
       // unload previous sound
@@ -257,7 +288,7 @@ export default function App() {
           await s.unloadAsync();
           const entry = {
             id: 'h' + Date.now(),
-            name: res.name || 'Imported Audio',
+            name: fileName,
             uri: finalUri,
             ts: Date.now(),
             duration: durationSec,
@@ -265,11 +296,13 @@ export default function App() {
             summary: null,
           };
           await addToHistory(entry);
+          console.log('Added to history with duration:', durationSec);
         } catch (e) {
           // if we can't load duration, still add (without duration)
+          console.warn('Could not get duration:', e);
           const entry = {
             id: 'h' + Date.now(),
-            name: res.name || 'Imported Audio',
+            name: fileName,
             uri: finalUri,
             ts: Date.now(),
             duration: null,
@@ -279,9 +312,11 @@ export default function App() {
           await addToHistory(entry);
         }
       }
+      
+      Alert.alert('Success', `Audio file "${fileName}" imported successfully!`);
     } catch (e) {
       console.error('pickAudioFile', e);
-      Alert.alert('Error', 'Unable to pick audio file.');
+      Alert.alert('Error', 'Unable to pick audio file: ' + e.message);
     }
   };
 
@@ -947,6 +982,10 @@ const stylesLight = StyleSheet.create({
   actionButton: { backgroundColor: '#11182706', padding: 10, borderRadius: 10, minWidth: 140, alignItems: 'center' },
   actionButtonText: { color: '#0F172A', fontWeight: '700' },
 
+  // Missing auth button styles
+  authButton: { backgroundColor: '#3B82F6', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8 },
+  authButtonText: { color: '#fff', fontSize: 12, fontWeight: '600' },
+
   modalOverlay: { flex: 1, backgroundColor: '#00000060', justifyContent: 'center', alignItems: 'center', padding: 16 },
   modalCard: { width: '100%', maxWidth: 640, backgroundColor: '#fff', borderRadius: 12, padding: 16 },
   modalTitle: { fontSize: 18, fontWeight: '800', color: '#0F172A' },
@@ -1001,6 +1040,10 @@ const stylesDark = StyleSheet.create({
   largeText: { color: '#E6EEF8', fontSize: 14, marginTop: 4 },
   actionButton: { backgroundColor: '#07102110', padding: 10, borderRadius: 10, minWidth: 140, alignItems: 'center' },
   actionButtonText: { color: '#E6EEF8', fontWeight: '700' },
+
+  // Missing auth button styles
+  authButton: { backgroundColor: '#2563EB', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8 },
+  authButtonText: { color: '#fff', fontSize: 12, fontWeight: '600' },
 
   modalOverlay: { flex: 1, backgroundColor: '#00000060', justifyContent: 'center', alignItems: 'center', padding: 16 },
   modalCard: { width: '100%', maxWidth: 640, backgroundColor: '#0F172A', borderRadius: 12, padding: 16 },
