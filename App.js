@@ -575,94 +575,128 @@ export default function App() {
   }, [authUser, isSignedIn]);
 
   /* ------------------ FILE PICKING ------------------ */
-  const pickAudioFile = useCallback(async () => {
+  const pickAudioFile = async () => {
     try {
-      const result = await DocumentPicker.getDocumentAsync({
-        type: ['audio/*'],
-        copyToCacheDirectory: false,
+      const res = await DocumentPicker.getDocumentAsync({
+        type: ['audio/*', 'audio/mp3', 'audio/mpeg', 'audio/wav', 'audio/m4a', 'audio/aac'],
+        copyToCacheDirectory: false, // we'll handle copying
+        multiple: false,
       });
-
-      let canceled = false;
-      let asset = null;
-      if ('canceled' in result) {
-        canceled = result.canceled;
-        asset = result.assets?.[0] ?? null;
-      } else {
-        canceled = result.type !== 'success';
-        asset = result;
-      }
-      if (canceled || !asset?.uri) return;
-
-      const resName = asset.name || 'Imported Audio';
-      let finalUri = asset.uri;
-
-      const inCache = finalUri.startsWith(FileSystem.cacheDirectory);
-      const hasFilePrefix = finalUri.startsWith('file://');
-      const needsCopyToCache = !(inCache || hasFilePrefix);
-
-      if (needsCopyToCache) {
-        const safeName = resName.replace(/[^\w.\-]/g, '_') || `imported-${Date.now()}.aac`;
-        const dest = FileSystem.cacheDirectory + `${Date.now()}-${safeName}`;
+      
+      if (res.canceled || !res.assets || res.assets.length === 0) return;
+      
+      const file = res.assets[0];
+      let finalUri = file.uri;
+      const fileName = file.name || `imported-${Date.now()}.mp3`;
+      
+      // On Android the URI may be content://; on iOS it's usually file://
+      // Try to get file into app cache so expo-av can use it reliably
+      if (!finalUri.startsWith(FileSystem.cacheDirectory) && !finalUri.startsWith('file://')) {
+        // Attempt to read as base64 and write into cache
         try {
-          const b64 = await FileSystem.readAsStringAsync(finalUri, {
-            encoding: FileSystem.EncodingType.Base64,
-          });
-          await FileSystem.writeAsStringAsync(dest, b64, {
-            encoding: FileSystem.EncodingType.Base64,
-          });
+          console.log('Reading file from content URI:', finalUri);
+          const b64 = await FileSystem.readAsStringAsync(finalUri, { encoding: FileSystem.EncodingType.Base64 });
+          const dest = FileSystem.cacheDirectory + fileName;
+          await FileSystem.writeAsStringAsync(dest, b64, { encoding: FileSystem.EncodingType.Base64 });
           finalUri = dest;
-        } catch (errRead) {
+          console.log('Successfully copied to cache:', finalUri);
+        } catch (e) {
+          // fallback: try to copy using copyAsync if available
           try {
-            await FileSystem.downloadAsync(finalUri, dest);
+            const dest = FileSystem.cacheDirectory + fileName;
+            await FileSystem.copyAsync({ from: finalUri, to: dest });
             finalUri = dest;
-          } catch (errDl) {
-            console.error('pickAudioFile: unable to copy URI', errRead, errDl);
-            Alert.alert('Import failed', 'Could not import selected audio file.');
-            return;
+            console.log('Successfully copied using copyAsync:', finalUri);
+          } catch (e2) {
+            // final fallback: try to download (works for http(s))
+            try {
+              const dest = FileSystem.cacheDirectory + fileName;
+              await FileSystem.downloadAsync(finalUri, dest);
+              finalUri = dest;
+              console.log('Successfully downloaded:', finalUri);
+            } catch (e3) {
+              console.error('pickAudioFile: unable to copy content URI', e, e2, e3);
+              Alert.alert('Import failed', 'Could not import selected audio file. Please try a different file or method.');
+              return;
+            }
           }
         }
-      } else if (!hasFilePrefix) {
+      } else if (finalUri.startsWith(FileSystem.cacheDirectory)) {
+        // already in cache
+        console.log('File already in cache:', finalUri);
+      } else if (!finalUri.startsWith('file://')) {
+        // Try prefixing file:// on some systems
         finalUri = 'file://' + finalUri;
+        console.log('Added file:// prefix:', finalUri);
       }
 
-      setAudioUri(finalUri);
-      setAudioName(resName);
-      setLiveTranscript('');
-      setTranscript('');
-      setSummary('');
+      // Verify the file exists and is accessible
+      try {
+        const fileInfo = await FileSystem.getInfoAsync(finalUri);
+        if (!fileInfo.exists) {
+          throw new Error('File does not exist at final URI');
+        }
+        console.log('File verified, size:', fileInfo.size, 'bytes');
+      } catch (e) {
+        console.error('File verification failed:', e);
+        Alert.alert('Import failed', 'The imported file could not be accessed. Please try again.');
+        return;
+      }
 
+      // Save state
+      setAudioUri(finalUri);
+      setAudioName(fileName);
+      setTranscript(''); // reset transcript for this audio
+      setSummary('');
+      // unload previous sound
       if (soundObj) {
         await soundObj.unloadAsync();
         setSoundObj(null);
         setIsPlaying(false);
       }
 
+      // Optionally store in history for signed-in users (store metadata and local uri)
       if (isSignedIn && authUser) {
-        const entryBase = {
-          id: 'h' + Date.now(),
-          name: resName,
-          uri: finalUri,
-          ts: Date.now(),
-          transcript: null,
-          summary: null,
-        };
+        // get duration if possible
         try {
           const s = new Audio.Sound();
           await s.loadAsync({ uri: finalUri });
           const status = await s.getStatusAsync();
           const durationSec = status.durationMillis ? Math.round(status.durationMillis / 1000) : null;
           await s.unloadAsync();
-          await addToHistory({ ...entryBase, duration: durationSec });
-        } catch {
-          await addToHistory({ ...entryBase, duration: null });
+          const entry = {
+            id: 'h' + Date.now(),
+            name: fileName,
+            uri: finalUri,
+            ts: Date.now(),
+            duration: durationSec,
+            transcript: null,
+            summary: null,
+          };
+          await addToHistory(entry);
+          console.log('Added to history with duration:', durationSec);
+        } catch (e) {
+          // if we can't load duration, still add (without duration)
+          console.warn('Could not get duration:', e);
+          const entry = {
+            id: 'h' + Date.now(),
+            name: fileName,
+            uri: finalUri,
+            ts: Date.now(),
+            duration: null,
+            transcript: null,
+            summary: null,
+          };
+          await addToHistory(entry);
         }
       }
-    } catch (err) {
-      console.error('pickAudioFile', err);
-      Alert.alert('Error', 'Unable to pick audio file.');
+      
+      Alert.alert('Success', `Audio file "${fileName}" imported successfully!`);
+    } catch (e) {
+      console.error('pickAudioFile', e);
+      Alert.alert('Error', 'Unable to pick audio file: ' + e.message);
     }
-  }, [soundObj, isSignedIn, authUser, addToHistory]);
-
+  };
   /* ------------------ RECORDING WITH LIVE STT ------------------ */
   const startRecording = useCallback(async () => {
     try {
